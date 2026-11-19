@@ -106,21 +106,66 @@ function extractDomain(uri: string): string {
   }
 }
 
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2, baseDelayMs = 600): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      lastError = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient =
+        msg.includes("503") ||
+        msg.includes("UNAVAILABLE") ||
+        msg.includes("ECONNRESET") ||
+        msg.includes("ETIMEDOUT") ||
+        msg.includes("fetch failed");
+      if (!isTransient || attempt === maxRetries) {
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)));
+    }
+  }
+  throw lastError;
+}
+
+function isMathOrComplexQuery(messages: ClientMessage[]): boolean {
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  if (!lastUser) return false;
+  const text = (lastUser.content || "").toLowerCase();
+  if (!text) return Boolean(lastUser.attachments?.length);
+  return (
+    /\b(math|calculus|algebra|geometry|trigonometry|equation|integral|derivative|matrix|probability|statistics|physics|chemistry|theorem|proof|solve|calculate|simplify|factor|limit|differential|logarithm|polynomial|quadratic)\b/i.test(
+      text
+    ) ||
+    /(গণিত|অঙ্ক|অংক|সমাধান|সমীকরণ|মান নির্ণয়|মান বের|প্রমাণ করো|সূত্র|জ্যামিতি|ত্রিকোণমিতি|বীজগণিত|ক্যালকুলাস|শতকরা|সুদ|অনুপাত|গুণ|ভাগ|যোগ|বিয়োগ|বর্গমূল)/i.test(
+      text
+    ) ||
+    /(onk|onko|gonit|somikoron|soman|math solve|hisab)/i.test(text) ||
+    /[=^√∫∑π±×÷]|\d+\s*[*+\-/^]\s*\d+/.test(text)
+  );
+}
+
 const SYSTEM_INSTRUCTION = `You are SAHIN AI, an intelligent, articulate, and versatile conversational AI assistant.
 
 Core behavior guidelines:
 - Identity: Your name is SAHIN AI. Never claim to be any other assistant, model family, or platform.
 - Speed & Responsiveness: Answer immediately, directly, and concisely without filler greetings or delay. Begin delivering the primary answer in the very first sentence.
 - Tone & Clarity: Write clearly, accurately, and thoughtfully. Structure complex answers with clean Markdown headings, concise bullet points, tables when comparing options, and fenced code blocks with language identifiers (e.g., \`\`\`typescript, \`\`\`python, \`\`\`bash).
+- Mathematics & STEM Excellence:
+  - For any math, physics, chemistry, or quantitative problem, always solve **step-by-step** showing every intermediate calculation clearly.
+  - Carefully verify signs, fractions, substitutions, units, and arithmetic before writing the final result.
+  - Always format inline math with single dollar signs ($x^2 + y^2 = r^2$) and standalone equations with double dollar signs ($$\\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$). Never leave raw unformatted LaTeX commands outside math delimiters.
+  - Conclude with a clearly highlighted **Final Answer** (or **চূড়ান্ত উত্তর** when answering in Bengali).
 - Multilingual Fluency: Respond naturally in the language or script the user uses (including English, Bengali / বাংলা, Banglish, Hindi, or any other language).
-- Vision & Image Analysis: When the user provides one or more images, inspect visual details, text/OCR, UI layouts, code screenshots, diagrams, or objects carefully and give structured, actionable insights.
+- Vision & Image Analysis: When the user provides one or more images (including handwritten math problems or diagrams), inspect every detail, OCR text/equations carefully, and provide structured, accurate solutions.
 - Web Search & Real-Time Grounding: When web search is enabled, synthesize up-to-date facts accurately and cite context naturally.`;
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: "25mb" }));
+  app.use(express.json({ limit: "35mb" }));
 
   app.get("/api/health", (_req: Request, res: Response) => {
     res.json({ status: "ok", app: "SAHIN AI" });
@@ -159,48 +204,91 @@ async function startServer() {
       }
 
       const ai = getGenAIClient();
+      const isComplex = isMathOrComplexQuery(messages);
+
+      // Select model candidates: complex math uses Gemini 4 Hydrogen with HIGH thinking level -> Flash Lite fallback
+      const modelCandidates = isComplex
+        ? [
+            { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.HIGH },
+            { model: "gemini-3.1-flash-lite", thinkingLevel: undefined },
+          ]
+        : [
+            { model: "gemini-4-hydrogen", thinkingLevel: undefined },
+            { model: "gemini-3.1-flash-lite", thinkingLevel: undefined },
+          ];
 
       let streamResponse: any = null;
       let usedSearch = Boolean(webSearchEnabled);
+      let lastStreamErr: unknown = null;
 
-      if (webSearchEnabled) {
-        try {
-          streamResponse = await ai.models.generateContentStream({
-            model: "gemini-3.1-flash-lite",
-            contents,
-            config: {
-              systemInstruction: SYSTEM_INSTRUCTION,
-              tools: [{ googleSearch: {} }],
-            },
-          });
-        } catch (searchErr: unknown) {
-          const msg = searchErr instanceof Error ? searchErr.message : "";
-          if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota")) {
-            console.warn("Web search tool quota exhausted; falling back to direct answer.");
-            usedSearch = false;
-            sendEvent({
-              type: "text",
-              delta: "*[Live Web Search quota limit reached; providing direct answer]*\n\n",
-            });
-            streamResponse = await ai.models.generateContentStream({
-              model: "gemini-3.1-flash-lite",
-              contents,
-              config: {
-                systemInstruction: SYSTEM_INSTRUCTION,
-              },
-            });
-          } else {
-            throw searchErr;
-          }
+      for (const candidate of modelCandidates) {
+        const baseConfig: Record<string, unknown> = {
+          systemInstruction: SYSTEM_INSTRUCTION,
+        };
+        if (candidate.thinkingLevel) {
+          baseConfig.thinkingConfig = { thinkingLevel: candidate.thinkingLevel };
         }
-      } else {
-        streamResponse = await ai.models.generateContentStream({
-          model: "gemini-3.1-flash-lite",
-          contents,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-          },
-        });
+
+        try {
+          if (usedSearch) {
+            try {
+              streamResponse = await withRetry(() =>
+                ai.models.generateContentStream({
+                  model: candidate.model,
+                  contents,
+                  config: {
+                    ...baseConfig,
+                    tools: [{ googleSearch: {} }],
+                  },
+                })
+              );
+              break;
+            } catch (searchErr: unknown) {
+              const sMsg = searchErr instanceof Error ? searchErr.message : "";
+              if (sMsg.includes("429") || sMsg.includes("RESOURCE_EXHAUSTED") || sMsg.includes("quota")) {
+                usedSearch = false;
+                streamResponse = await withRetry(() =>
+                  ai.models.generateContentStream({
+                    model: candidate.model,
+                    contents,
+                    config: baseConfig,
+                  })
+                );
+                break;
+              }
+              throw searchErr;
+            }
+          } else {
+            streamResponse = await withRetry(() =>
+              ai.models.generateContentStream({
+                model: candidate.model,
+                contents,
+                config: baseConfig,
+              })
+            );
+            break;
+          }
+        } catch (err: unknown) {
+          lastStreamErr = err;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const canFallback =
+            errMsg.includes("429") ||
+            errMsg.includes("RESOURCE_EXHAUSTED") ||
+            errMsg.includes("403") ||
+            errMsg.includes("PERMISSION_DENIED") ||
+            errMsg.includes("404") ||
+            errMsg.includes("NOT_FOUND") ||
+            errMsg.includes("503") ||
+            errMsg.includes("UNAVAILABLE");
+          if (!canFallback) {
+            throw err;
+          }
+          console.warn(`Model ${candidate.model} unavailable, trying next fallback:`, errMsg);
+        }
+      }
+
+      if (!streamResponse) {
+        throw lastStreamErr || new Error("Unable to reach AI chat model.");
       }
 
       const collectedSources = new Map<string, WebSource>();
@@ -279,143 +367,155 @@ async function startServer() {
 
   app.post("/api/generate-image", async (req: Request, res: Response) => {
     try {
-      const { prompt, aspectRatio } = req.body as {
+      const { prompt, aspectRatio, referenceImageBase64, mimeType } = req.body as {
         prompt?: string;
         aspectRatio?: string;
+        referenceImageBase64?: string;
+        mimeType?: string;
       };
 
       const rawPrompt = (prompt || "").trim();
       if (!rawPrompt) {
-        res.status(400).json({ success: false, error: "Please provide a prompt describing the image you want to create." });
+        res.status(400).json({
+          success: false,
+          error: "Please provide a prompt describing the image you want to create.",
+        });
         return;
       }
 
-      // Check if prompt contains Bengali or non-English characters, or enrich visual fidelity with Gemini
+      const allowedRatios = ["1:1", "16:9", "9:16", "4:3", "3:4"];
+      const validRatio = allowedRatios.includes(aspectRatio || "") ? aspectRatio! : "1:1";
+
+      const ai = getGenAIClient();
+
+      // Prompt Enrichment (and visual inspection if reference image attached) via Gemini 4 Hydrogen
       let enrichedPrompt = rawPrompt;
       try {
-        const ai = getGenAIClient();
-        const enrichResponse = await ai.models.generateContent({
-          model: "gemini-3.1-flash-lite",
-          contents: `You are an AI image prompt synthesizer. The user wants to generate an image from this description: "${rawPrompt}". If the description is in Bengali, Hindi, or any other language, translate it into English and enhance it with vivid visual details, lighting, and composition suited for image generation. Return ONLY the enhanced English prompt as a single paragraph without any preamble or quotes.`,
-        });
+        const promptParts: Part[] = [];
+        if (referenceImageBase64) {
+          const parsed = extractBase64Payload(referenceImageBase64);
+          if (parsed) {
+            promptParts.push({
+              inlineData: {
+                data: parsed.data,
+                mimeType: mimeType || parsed.mimeType || "image/png",
+              },
+            });
+            promptParts.push({
+              text: `Describe the attached image's subject, style, colors, and composition combined with this user edit/generation instruction: "${rawPrompt}". Return ONLY a single vivid English image-generation prompt paragraph without quotes.`,
+            });
+          }
+        }
+
+        const enrichResponse = await withRetry(() =>
+          ai.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents:
+              promptParts.length > 0
+                ? { parts: promptParts }
+                : `You are an expert AI image prompt designer. Translate this description to vivid English if needed and expand it into a crisp, photorealistic, high-detail 4K image generation prompt: "${rawPrompt}". Return ONLY the enhanced English prompt paragraph without quotes.`,
+          })
+        );
         const generated = enrichResponse.text?.trim();
         if (generated && generated.length > 5) {
           enrichedPrompt = generated.replace(/^["'`]+|["'`]+$/g, "");
         }
       } catch {
-        // Fallback to original prompt if enrichment model is briefly unavailable
+        // Fallback to raw prompt if enrichment call is briefly unavailable
       }
 
-      // 2K / 4K Ultra-HD AI Image Synthesis
-      let width = 2048;
-      let height = 2048;
-      if (aspectRatio === "16:9") {
-        width = 2560;
-        height = 1440; // 2K QHD Widescreen
-      } else if (aspectRatio === "9:16") {
-        width = 1440;
-        height = 2560; // 2K QHD Portrait
-      } else if (aspectRatio === "4:3") {
-        width = 2048;
-        height = 1536;
-      } else if (aspectRatio === "3:4") {
-        width = 1536;
-        height = 2048;
-      }
+      const sizePresets: Record<string, Array<{ w: number; h: number }>> = {
+        "16:9": [
+          { w: 3840, h: 2160 },
+          { w: 1920, h: 1080 },
+        ],
+        "9:16": [
+          { w: 2160, h: 3840 },
+          { w: 1080, h: 1920 },
+        ],
+        "4:3": [
+          { w: 2560, h: 1920 },
+          { w: 1600, h: 1200 },
+        ],
+        "3:4": [
+          { w: 1920, h: 2560 },
+          { w: 1200, h: 1600 },
+        ],
+        "1:1": [
+          { w: 2560, h: 2560 },
+          { w: 1536, h: 1536 },
+        ],
+      };
 
+      const candidates = sizePresets[validRatio] || sizePresets["1:1"];
       const seed = Math.floor(Math.random() * 1000000);
-      const promptWithQuality = `${enrichedPrompt}, 4k ultra hd resolution, photorealistic masterpiece, 8k textures, sharp focus`;
-      const encoded = encodeURIComponent(promptWithQuality.slice(0, 450));
-      const pollUrl = `https://image.pollinations.ai/prompt/${encoded}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
+      const promptWithQuality = `${enrichedPrompt}, ultra detailed 4k photography, natural lighting, sharp focus, rich color depth`;
+      const encoded = encodeURIComponent(promptWithQuality.slice(0, 480));
 
-      const fetchRes = await fetch(pollUrl, { signal: AbortSignal.timeout(28000) });
-      if (!fetchRes.ok) {
-        throw new Error(`Synthesis engine returned status ${fetchRes.status}`);
+      for (const dims of candidates) {
+        try {
+          const pollUrl = `https://image.pollinations.ai/prompt/${encoded}?model=flux&width=${dims.w}&height=${dims.h}&seed=${seed}&nologo=true&enhance=true`;
+          const fetchRes = await fetch(pollUrl, { signal: AbortSignal.timeout(26000) });
+          if (!fetchRes.ok) continue;
+
+          const contentType = fetchRes.headers.get("content-type") || "image/jpeg";
+          if (!contentType.startsWith("image/")) continue;
+
+          const arrayBuffer = await fetchRes.arrayBuffer();
+          if (arrayBuffer.byteLength < 1024) continue;
+
+          const base64 = Buffer.from(arrayBuffer).toString("base64");
+          res.json({
+            success: true,
+            imageUrl: `data:${contentType};base64,${base64}`,
+            prompt: rawPrompt,
+            enhancedPrompt: enrichedPrompt,
+            model: "SAHIN-AI-4K-Flux",
+            resolution: dims.w >= 2560 ? "4K" : `${dims.w}x${dims.h}`,
+          });
+          return;
+        } catch {
+          // Try smaller candidate dimensions on timeout
+        }
       }
 
-      const arrayBuffer = await fetchRes.arrayBuffer();
-      const base64 = Buffer.from(arrayBuffer).toString("base64");
-      const contentType = fetchRes.headers.get("content-type") || "image/jpeg";
-      const dataUrl = `data:${contentType};base64,${base64}`;
-
-      res.json({
-        success: true,
-        imageUrl: dataUrl,
-        prompt: rawPrompt,
-        enhancedPrompt: enrichedPrompt,
-        model: "SAHIN-AI-Synthesis",
-      });
+      throw new Error("Image synthesis service is temporarily busy. Please try again.");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Failed to synthesize image.";
       console.warn("Image generation notice:", msg);
       res.status(500).json({
         success: false,
-        error: `Could not generate image: ${msg}. Please try again with a descriptive prompt.`,
+        error: `Could not generate image: ${msg}`,
       });
     }
   });
 
   app.post("/api/generate-video", async (req: Request, res: Response) => {
     try {
-      const { imageBase64, mimeType, motionPrompt } = req.body as {
+      const { imageBase64, motionPrompt } = req.body as {
         imageBase64?: string;
         mimeType?: string;
         motionPrompt?: string;
+        aspectRatio?: string;
       };
 
-      if (!imageBase64) {
-        res.status(400).json({ success: false, error: "Image data is required to generate video." });
+      const promptText =
+        (motionPrompt || "").trim() ||
+        "Cinematic camera motion, natural lighting, fluid atmospheric movement.";
+
+      if (!imageBase64 && !motionPrompt) {
+        res.status(400).json({
+          success: false,
+          error: "Either a prompt or a source image is required to generate video.",
+        });
         return;
       }
 
-      // Try Gemini Omni Flash video generation if available
-      try {
-        const ai = getGenAIClient();
-        const interaction = await ai.interactions.create(
-          {
-            model: "gemini-omni-1.1-flash",
-            input: [
-              {
-                type: "image",
-                mime_type: mimeType || "image/jpeg",
-                data: imageBase64.replace(/^data:[^;]+;base64,/, ""),
-              },
-              {
-                type: "text",
-                text: motionPrompt || "Cinematic camera zoom and subtle lifelike motion.",
-              },
-            ],
-            background: false,
-            store: false,
-            stream: false,
-            response_format: {
-              type: "video",
-              aspect_ratio: "16:9",
-            },
-          },
-          { timeout: 120000 }
-        );
-
-        const videoPart = interaction.output_video;
-        if (videoPart && videoPart.data) {
-          const videoDataUrl = `data:${videoPart.mime_type || "video/mp4"};base64,${videoPart.data}`;
-          res.json({
-            success: true,
-            videoUrl: videoDataUrl,
-            model: "gemini-omni-1.1-flash",
-          });
-          return;
-        }
-      } catch (geminiErr: unknown) {
-        const notice = geminiErr instanceof Error ? geminiErr.message : "";
-        console.info("Gemini Omni Flash unavailable, routing to SAHIN AI Motion Studio:", notice);
-      }
-
-      // Signal client-side high-fidelity motion rendering
+      // Route directly to SAHIN AI client-side Motion Studio rendering engine
       res.json({
         success: false,
         fallbackToClientEngine: true,
-        motionPrompt: motionPrompt || "Cinematic Camera Motion",
+        motionPrompt: promptText,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Video route error";
@@ -436,56 +536,70 @@ async function startServer() {
         return;
       }
 
-      // Clean markdown code blocks, links, bullets, and emojis for natural spoken audio
+      // Clean markdown & LaTeX equations for natural spoken audio
       const cleaned = rawText
         .replace(/```[\s\S]*?```/g, "Code block omitted.")
         .replace(/`([^`]+)`/g, "$1")
+        .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, "$1 divided by $2")
+        .replace(/\\sqrt\{([^}]+)\}/g, "square root of $1")
+        .replace(/\$\$([\s\S]*?)\$\$/g, " $1 ")
+        .replace(/\$([^$\n]+)\$/g, " $1 ")
+        .replace(/\\[a-zA-Z]+/g, " ")
         .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-        .replace(/[*_#~>]/g, "")
-        .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "")
+        .replace(/[*_#~>{}]/g, " ")
+        .replace(
+          /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu,
+          ""
+        )
         .replace(/\s+/g, " ")
         .trim();
 
-      const textToSpeak = cleaned.slice(0, 1500);
+      const textToSpeak = cleaned.slice(0, 2200);
       const isBengali = /[\u0980-\u09FF]/.test(textToSpeak);
 
-      // Attempt Gemini 3.8 Flash Lite TTS
+      // Attempt Gemini 3.8 Flash Lite TTS with retry
       try {
         const ai = getGenAIClient();
-        const ttsResponse = await ai.models.generateContent({
-          model: "gemini-3.8-flash-lite-tts",
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: textToSpeak,
-                  speechMetadata: {
-                    style: isBengali
-                      ? "Natural, clear, articulate Bengali speaker with warm, friendly tone"
-                      : "Warm, clear, and friendly voice assistant",
+        const ttsResponse = await withRetry(() =>
+          ai.models.generateContent({
+            model: "gemini-3.8-flash-lite-tts",
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: textToSpeak,
+                    speechMetadata: {
+                      style: isBengali
+                        ? "Natural, clear, articulate Bengali speaker with warm, friendly tone"
+                        : "Warm, clear, and friendly voice assistant",
+                    },
                   },
+                ],
+              },
+            ],
+            config: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: voice || "Kore" },
                 },
-              ],
-            },
-          ],
-          config: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: voice || "Kore" },
               },
             },
-          },
-        });
+          })
+        );
 
-        const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        const audioPart = ttsResponse.candidates?.[0]?.content?.parts?.find(
+          (p) => p.inlineData?.data
+        );
+        const base64Audio = audioPart?.inlineData?.data;
+        const mimeType = audioPart?.inlineData?.mimeType || "audio/wav";
         if (base64Audio) {
-          const audioUrl = `data:audio/wav;base64,${base64Audio}`;
+          const audioUrl = `data:${mimeType};base64,${base64Audio}`;
           res.json({
             success: true,
             audioUrl,
-            format: "audio/wav",
+            format: mimeType,
             model: "gemini-3.8-flash-lite-tts",
             cleanText: textToSpeak,
           });
@@ -493,7 +607,7 @@ async function startServer() {
         }
       } catch (geminiErr: unknown) {
         const notice = geminiErr instanceof Error ? geminiErr.message : "";
-        console.info("Gemini TTS service notice, falling back to high-fidelity client voice:", notice);
+        console.info("Gemini TTS service notice, falling back to browser voice:", notice);
       }
 
       // Fallback: Signal client to use Web Speech API with cleanText
@@ -511,7 +625,7 @@ async function startServer() {
 
   app.post("/api/chat/title", async (req: Request, res: Response) => {
     try {
-      const { userMessage, assistantMessage } = req.body as {
+      const { userMessage } = req.body as {
         userMessage?: string;
         assistantMessage?: string;
       };
@@ -524,7 +638,7 @@ async function startServer() {
 
       const ai = getGenAIClient();
       const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-lite",
+        model: "gemini-4-hydrogen",
         contents: `Generate a concise 3 to 5 word title for this chat: "${seedText.slice(0, 150)}". Return ONLY the plain title without quotes.`,
       });
 

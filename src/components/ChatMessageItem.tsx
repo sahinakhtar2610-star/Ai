@@ -18,6 +18,7 @@ import type { Attachment, ChatMessage } from "../types/chat";
 import { BrandMark } from "./BrandMark";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import {
+  getCachedAudioUrl,
   speakAssistantText,
   stopAllSpeech,
   subscribeSpeechState,
@@ -53,18 +54,32 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
 }) => {
   const [copied, setCopied] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isLoadingVoice, setIsLoadingVoice] = useState(false);
+  const [audioUrl, setAudioUrl] = useState<string | undefined>(
+    () => message.audioUrl || getCachedAudioUrl(message.id)
+  );
 
   useEffect(() => {
-    return subscribeSpeechState((speakerId) => {
+    return subscribeSpeechState(({ speakerId, loadingId }) => {
       setIsSpeaking(speakerId === message.id);
+      setIsLoadingVoice(loadingId === message.id);
     });
   }, [message.id]);
 
+  useEffect(() => {
+    if (message.audioUrl) {
+      setAudioUrl(message.audioUrl);
+    }
+  }, [message.audioUrl]);
+
   const handleToggleVoice = () => {
-    if (isSpeaking) {
+    if (isSpeaking || isLoadingVoice) {
       stopAllSpeech();
     } else {
-      speakAssistantText(message.id, message.content);
+      speakAssistantText(message.id, message.content, {
+        onAudioReady: (url) => setAudioUrl(url),
+        onAutoplayBlocked: (url) => setAudioUrl(url),
+      });
     }
   };
 
@@ -408,6 +423,28 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
           </div>
         )}
 
+        {/* Inline Audio Player when Gemini TTS audio has been synthesized */}
+        {audioUrl && !isStreaming && !message.isError && (
+          <div className="flex items-center gap-2.5 p-2.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/90 dark:bg-zinc-900/80 max-w-md">
+            <Volume2 className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0" />
+            <audio
+              src={audioUrl}
+              controls
+              className="h-8 w-full min-w-0"
+              aria-label="SAHIN AI voice audio"
+            />
+            <a
+              href={audioUrl}
+              download={`sahin-ai-voice-${message.id.slice(0, 6)}.wav`}
+              className="p-1.5 rounded-lg text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition-colors shrink-0"
+              title="Download voice audio (.wav)"
+              aria-label="Download voice audio"
+            >
+              <Download className="w-3.5 h-3.5" />
+            </a>
+          </div>
+        )}
+
         {/* Action Controls */}
         {!isStreaming && message.content && !message.isError && (
           <div className="flex items-center gap-2 pt-1 text-xs text-zinc-500 dark:text-zinc-400 flex-wrap">
@@ -434,13 +471,22 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
               type="button"
               onClick={handleToggleVoice}
               className={`inline-flex items-center gap-1.5 py-1 px-2 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                isSpeaking
+                isSpeaking || isLoadingVoice
                   ? "bg-teal-500/15 text-teal-600 dark:text-teal-400 font-medium ring-1 ring-teal-500/30"
                   : "hover:bg-zinc-100 dark:hover:bg-zinc-800/80 hover:text-zinc-900 dark:hover:text-zinc-100"
               }`}
-              title={isSpeaking ? "Stop voice playback" : "Listen to this reply in voice"}
+              title={
+                isSpeaking || isLoadingVoice
+                  ? "Stop voice playback"
+                  : "Listen to this reply in voice"
+              }
             >
-              {isSpeaking ? (
+              {isLoadingVoice ? (
+                <>
+                  <Volume2 className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 animate-pulse" />
+                  <span>ভয়েস তৈরি হচ্ছে...</span>
+                </>
+              ) : isSpeaking ? (
                 <>
                   <VolumeX className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
                   <span>থামান / Stop</span>

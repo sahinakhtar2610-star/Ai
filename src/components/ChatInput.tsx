@@ -372,10 +372,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               isListening
                 ? "Listening... Speak clearly to transcribe into your prompt."
                 : imageGenMode
-                ? "Describe the image you want SAHIN A AI to create (e.g. 'Futuristic city' or 'একটি সুন্দর পাখির ছবি')..."
+                ? "Describe the 4K image you want SAHIN AI to create (e.g. 'Futuristic city' or 'একটি সুন্দর পাখির ছবি')..."
+                : videoGenMode
+                ? "Describe the 10s video or attach a photo to animate..."
                 : webSearchEnabled
-                ? "Ask SAHIN A AI anything or search the live web..."
-                : "Message SAHIN A AI, speak via microphone, or ask to create an image..."
+                ? "Ask SAHIN AI anything or search the live web..."
+                : "Message SAHIN AI — ask math, create 4K images, generate videos, or speak..."
             }
             className="w-full resize-none bg-transparent text-[15px] leading-relaxed text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 focus:outline-none max-h-[200px]"
             aria-label="Chat message input"
@@ -497,7 +499,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                     imageGenMode ? "text-indigo-600 dark:text-indigo-400" : ""
                   }`}
                 />
-                <span>{imageGenMode ? "Image: On" : "Image"}</span>
+                <span>{imageGenMode ? "Image 4K: On" : "Image 4K"}</span>
               </button>
             )}
 
@@ -574,7 +576,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       </div>
 
       <p className="mt-2 text-center text-[11px] text-zinc-400 dark:text-zinc-500 select-none">
-        SAHIN A AI supports AI image creation, voice-to-text dictation, vision analysis, and live web search.
+        SAHIN AI supports 4K AI images, video synthesis, voice output, step-by-step math, and live web search.
       </p>
     </div>
   );

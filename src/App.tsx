@@ -38,6 +38,8 @@ import { ChatInput } from "./components/ChatInput";
 import { CapabilitiesModal } from "./components/CapabilitiesModal";
 import { AppSplashScreen } from "./components/AppSplashScreen";
 import { LoginModal } from "./components/LoginModal";
+import { PWAInstallButton } from "./components/PWAInstallButton";
+import { OfflineIndicator } from "./components/OfflineIndicator";
 import { useAuth } from "./context/AuthContext";
 
 const STORAGE_CONVERSATIONS_KEY = "sahin_ai_saved_conversations_v3";
@@ -89,20 +91,23 @@ const STARTER_PROMPTS: StarterPrompt[] = [
 export function isImageGenerationIntent(text: string): boolean {
   const t = text.toLowerCase().trim();
   if (!t) return false;
+  if (/hoi na|hoy na|why|কেন|problem|error|fix|thik koro|thik kor|কাজ করে না|কাজ হয় না/i.test(t)) {
+    return false;
+  }
   // Bengali intent triggers:
   if (
-    /ছবি.*(আঁকো|বানাও|তৈরি|দাও|করো|জেনারেট)/i.test(t) ||
-    /(আঁকো|বানাও|তৈরি|জেনারেট).*(ছবি|ইমেজ|পিকচার)/i.test(t) ||
-    /(chobi|chhobi).*(toiri|banao|anko|draw|generate|make)/i.test(t) ||
-    /(toiri koro|banao|anko).*(chobi|chhobi)/i.test(t) ||
+    /(ছবি|ফটো|ইমেজ|পিকচার).*(আঁকো|বানাও|তৈরি|দাও|করো|জেনারেট)/i.test(t) ||
+    /(আঁকো|বানাও|তৈরি|জেনারেট).*(ছবি|ইমেজ|পিকচার|ফটো)/i.test(t) ||
+    /(chobi|chhobi|photo|image).*(toiri|banao|anko|draw|generate|make)/i.test(t) ||
+    /(toiri koro|banao|anko).*(chobi|chhobi|photo|image)/i.test(t) ||
     /^(chobi|chhobi)\b/i.test(t)
   ) {
     return true;
   }
   // English intent triggers:
   if (
-    /^(\/image|generate image|create image|draw|paint|sketch|make an image|generate a picture|draw a picture|draw an image|create a picture)\b/i.test(t) ||
-    /\b(generate an image|create an image|draw an image of|draw a picture of|paint an image of|generate a photo of|create a photo of|sketch a picture of)\b/i.test(t)
+    /^(\/image|generate image|create image|draw|paint|sketch|make an image|generate a picture|draw a picture|draw an image|create a picture|4k image|4k photo)\b/i.test(t) ||
+    /\b(generate an image|create an image|draw an image of|draw a picture of|paint an image of|generate a photo of|create a photo of|sketch a picture of|create a 4k|generate a 4k)\b/i.test(t)
   ) {
     return true;
   }
@@ -157,6 +162,18 @@ export function isVoiceGenerationIntent(text: string): boolean {
     return true;
   }
   return false;
+}
+
+function detectAspectRatio(prompt: string): string {
+  if (/\b16:9\b|landscape|widescreen|thumbnail|youtube|wallpaper|সিনেমাটিক/i.test(prompt)) {
+    return "16:9";
+  }
+  if (/\b9:16\b|portrait|vertical|reels|shorts|tiktok|story/i.test(prompt)) {
+    return "9:16";
+  }
+  if (/\b4:3\b/i.test(prompt)) return "4:3";
+  if (/\b3:4\b/i.test(prompt)) return "3:4";
+  return "1:1";
 }
 
 function loadInitialTheme(): "light" | "dark" {
@@ -477,7 +494,24 @@ export function App() {
       }
 
       if (shouldSpeakVoice && fullAssistantText.trim()) {
-        speakAssistantText(assistantMessageId, fullAssistantText);
+        const attachAudio = (url: string) => {
+          setConversations((prev) =>
+            prev.map((conv) =>
+              conv.id !== convId
+                ? conv
+                : {
+                    ...conv,
+                    messages: conv.messages.map((m) =>
+                      m.id === assistantMessageId ? { ...m, audioUrl: url } : m
+                    ),
+                  }
+            )
+          );
+        };
+        speakAssistantText(assistantMessageId, fullAssistantText, {
+          onAudioReady: attachAudio,
+          onAutoplayBlocked: attachAudio,
+        });
       }
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -526,12 +560,13 @@ export function App() {
     convId: string,
     assistantMessageId: string,
     promptText: string,
-    isFirstTurn: boolean
+    isFirstTurn: boolean,
+    referenceAttachment?: Attachment
   ) => {
     setIsStreaming(true);
     const isBengali = /[\u0980-\u09FF]/.test(promptText);
+    const aspectRatio = detectAspectRatio(promptText);
 
-    // Initial placeholder status
     setConversations((prev) =>
       prev.map((c) =>
         c.id !== convId
@@ -544,8 +579,8 @@ export function App() {
                   ? {
                       ...m,
                       content: isBengali
-                        ? "🎨 SAHIN AI আপনার ছবিটি আঁকছে, অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন..."
-                        : "🎨 Synthesizing your image with SAHIN AI, please wait a moment...",
+                        ? "🎨 SAHIN AI আপনার ৪কে ছবিটি তৈরি করছে, অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন..."
+                        : "🎨 Synthesizing your 4K image with SAHIN AI, please wait a moment...",
                     }
                   : m
               ),
@@ -557,7 +592,12 @@ export function App() {
       const response = await fetch("/api/generate-image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: promptText }),
+        body: JSON.stringify({
+          prompt: promptText,
+          aspectRatio,
+          referenceImageBase64: referenceAttachment?.dataUrl,
+          mimeType: referenceAttachment?.mimeType,
+        }),
       });
 
       const data = await response.json();
@@ -571,7 +611,7 @@ export function App() {
         watermarkedUrl = await stampAppBrandWatermark(data.imageUrl, {
           appName: "SAHIN AI",
           logoUrl: "/logo.png",
-          tagline: "AI CREATION",
+          tagline: data.resolution === "4K" ? "4K ULTRA HD" : "AI CREATION",
           position: "bottom-right",
         });
       } catch (stampErr) {
@@ -579,8 +619,8 @@ export function App() {
       }
 
       const caption = isBengali
-        ? `আপনার অনুরোধ অনুযায়ী ছবিটি তৈরি করা হয়েছে:`
-        : `Here is your generated image based on: **"${promptText}"**`;
+        ? `আপনার অনুরোধ অনুযায়ী ৪কে ছবিটি তৈরি করা হয়েছে (${data.model || "SAHIN AI"}):`
+        : `Here is your generated 4K image (${data.model || "SAHIN AI"}) based on: **"${promptText}"**`;
 
       setConversations((prev) =>
         prev.map((c) =>
@@ -599,6 +639,7 @@ export function App() {
                             id: createId(),
                             url: watermarkedUrl,
                             prompt: data.prompt || promptText,
+                            aspectRatio,
                             modelUsed: data.model,
                             createdAt: Date.now(),
                           },
@@ -646,38 +687,41 @@ export function App() {
   const generateVideoReply = async (
     convId: string,
     assistantMessageId: string,
-    sourceImageUrl: string,
+    sourceImageUrl: string | undefined,
     promptText: string,
     isFirstTurn: boolean
   ) => {
     setIsStreaming(true);
     const isBengali = /[\u0980-\u09FF]/.test(promptText);
+    const aspectRatio = detectAspectRatio(promptText) === "9:16" ? "9:16" : "16:9";
 
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id !== convId
-          ? c
-          : {
-              ...c,
-              updatedAt: Date.now(),
-              messages: c.messages.map((m) =>
-                m.id === assistantMessageId
-                  ? {
-                      ...m,
-                      content: isBengali
-                        ? "🎬 SAHIN AI আপনার ফটো থেকে মোশন ভিডিও তৈরি করছে, কয়েক সেকেন্ড অপেক্ষা করুন..."
-                        : "🎬 Synthesizing cinematic motion video from your photo with SAHIN AI, please wait a moment...",
-                    }
-                  : m
-              ),
-            }
-      )
+    const updateStatusText = (statusText: string) => {
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id !== convId
+            ? c
+            : {
+                ...c,
+                updatedAt: Date.now(),
+                messages: c.messages.map((m) =>
+                  m.id === assistantMessageId ? { ...m, content: statusText } : m
+                ),
+              }
+        )
+      );
+    };
+
+    updateStatusText(
+      isBengali
+        ? "🎬 SAHIN AI আপনার ভিডিও তৈরি করছে, অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন..."
+        : "🎬 Generating your 1080p cinematic video with SAHIN AI, please wait a moment..."
     );
 
     try {
       let finalVideoUrl = "";
+      let modelUsed = "SAHIN-AI-Motion-Studio";
 
-      // 1. First attempt backend video synthesis
+      // 1. Attempt Gemini Omni 1.2 Flash video synthesis (supports both Text-to-Video and Image-to-Video)
       try {
         const resp = await fetch("/api/generate-video", {
           method: "POST",
@@ -685,29 +729,66 @@ export function App() {
           body: JSON.stringify({
             imageBase64: sourceImageUrl,
             motionPrompt: promptText,
+            aspectRatio,
           }),
         });
         const serverData = await resp.json();
         if (resp.ok && serverData.success && serverData.videoUrl) {
           finalVideoUrl = serverData.videoUrl;
+          modelUsed = serverData.model || "gemini-omni-1.2-flash";
         }
       } catch (srvErr) {
         console.warn("Backend video route notice:", srvErr);
       }
 
-      // 2. Client-side synthesis fallback (guarantees 100% video creation success with SAHIN AI watermark)
-      if (!finalVideoUrl) {
-        const clientSynth = await generateVideoFromPhoto(sourceImageUrl, {
+      // 2. If Gemini Omni Flash fell back, synthesize/animate via SAHIN AI Motion Studio
+      let baseSceneUrl = sourceImageUrl;
+      if (!finalVideoUrl && !baseSceneUrl) {
+        updateStatusText(
+          isBengali
+            ? "🎨 ভিডিওর জন্য ৪কে সিন তৈরি হচ্ছে..."
+            : "🎨 Synthesizing 4K scene frame for video..."
+        );
+        const imgResp = await fetch("/api/generate-image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: promptText || "Cinematic 4K nature landscape",
+            aspectRatio: "16:9",
+          }),
+        });
+        const imgData = await imgResp.json();
+        if (!imgResp.ok || !imgData.success || !imgData.imageUrl) {
+          throw new Error(
+            imgData.error || "Could not synthesize base scene for video generation."
+          );
+        }
+        baseSceneUrl = imgData.imageUrl;
+      }
+
+      if (!finalVideoUrl && baseSceneUrl) {
+        const clientSynth = await generateVideoFromPhoto(baseSceneUrl, {
           durationSeconds: 10,
           fps: 30,
           motionPreset: "cinematic_zoom",
+          onProgress: (pct) => {
+            updateStatusText(
+              isBengali
+                ? `🎬 SAHIN AI মোশন ভিডিও রেন্ডার হচ্ছে... ${pct}%`
+                : `🎬 Rendering 10s HD motion video... ${pct}%`
+            );
+          },
         });
         finalVideoUrl = clientSynth.videoUrl;
       }
 
+      if (!finalVideoUrl) {
+        throw new Error("Video generation did not return playable media.");
+      }
+
       const caption = isBengali
-        ? `আপনার ফটো থেকে সফলভাবে ১০ সেকেন্ডের মোশন ভিডিও তৈরি করা হয়েছে:`
-        : `Here is your 10-second animated video generated from your photo:`;
+        ? `আপনার ভিডিও সফলভাবে তৈরি করা হয়েছে (${modelUsed}):`
+        : `Here is your generated 10-second video (${modelUsed}):`;
 
       setConversations((prev) =>
         prev.map((c) =>
@@ -725,10 +806,10 @@ export function App() {
                           {
                             id: createId(),
                             url: finalVideoUrl,
-                            sourceImageUrl,
-                            prompt: promptText || "Photo Motion Animation",
+                            sourceImageUrl: baseSceneUrl,
+                            prompt: promptText || "AI Motion Video",
                             durationSeconds: 10,
-                            modelUsed: "SAHIN-AI-Motion-Studio",
+                            modelUsed,
                             createdAt: Date.now(),
                           },
                         ],
@@ -740,7 +821,7 @@ export function App() {
       );
 
       if (isFirstTurn) {
-        generateAutoTitle(convId, promptText || "Photo to Video", "AI Video");
+        generateAutoTitle(convId, promptText || "AI Video", "AI Video");
       }
 
       if (voiceAutoSpeak) {
@@ -928,8 +1009,8 @@ export function App() {
     // Route to Video Generation if requested
     if (isVideoGen) {
       let imageToAnimate = attachmentsToSend[0]?.dataUrl;
-      // Look for latest image in conversation if none attached
-      if (!imageToAnimate && targetConvId) {
+      // Look for latest image in conversation if none attached and user explicitly mentions animating/photo
+      if (!imageToAnimate && targetConvId && /(photo|image|ছবি|ফটো|this|এটা)/i.test(textToSend)) {
         const conv = conversations.find((c) => c.id === targetConvId);
         if (conv) {
           for (let i = conv.messages.length - 1; i >= 0; i--) {
@@ -946,67 +1027,14 @@ export function App() {
         }
       }
 
-      // If no photo was attached, synthesize the 4K base image from the prompt first, then animate it into video!
-      if (!imageToAnimate) {
-        const videoPrompt = textToSend || "Cinematic 4K nature motion";
-        const isBengali = /[\u0980-\u09FF]/.test(videoPrompt);
-
-        setConversations((prev) =>
-          prev.map((c) =>
-            c.id !== targetConvId
-              ? c
-              : {
-                  ...c,
-                  updatedAt: now,
-                  messages: c.messages.map((m) =>
-                    m.id === assistantMessageId
-                      ? {
-                          ...m,
-                          content: isBengali
-                            ? "🎬 SAHIN AI আপনার প্রম্পট থেকে ৪কে সিন প্রস্তুত করে ১০ সেকেন্ডের মোশন ভিডিও তৈরি করছে, কয়েক সেকেন্ড অপেক্ষা করুন..."
-                            : "🎬 Synthesizing 4K scene & rendering 10-second cinematic video with SAHIN AI...",
-                        }
-                      : m
-                  ),
-                }
-          )
-        );
-
-        try {
-          const imgResp = await fetch("/api/generate-image", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ prompt: videoPrompt, aspectRatio: "16:9" }),
-          });
-          const imgData = await imgResp.json();
-          if (imgResp.ok && imgData.success && imgData.imageUrl) {
-            imageToAnimate = imgData.imageUrl;
-            try {
-              imageToAnimate = await stampAppBrandWatermark(imgData.imageUrl, {
-                appName: "SAHIN AI",
-                logoUrl: "/logo.png",
-                tagline: "4K ULTRA HD",
-                position: "bottom-right",
-              });
-            } catch {
-              // Ignore watermark stamp fallback
-            }
-          }
-        } catch (imgErr) {
-          console.warn("Base image generation for video failed:", imgErr);
-        }
-      }
-
-      if (imageToAnimate) {
-        await generateVideoReply(
-          targetConvId,
-          assistantMessageId,
-          imageToAnimate,
-          textToSend || "Cinematic Motion Video",
-          isFirstTurn
-        );
-        return;
-      }
+      await generateVideoReply(
+        targetConvId,
+        assistantMessageId,
+        imageToAnimate,
+        textToSend || "Cinematic Motion Video",
+        isFirstTurn
+      );
+      return;
     }
 
     // Route to Image Generation engine if requested or detected
@@ -1015,7 +1043,8 @@ export function App() {
         targetConvId,
         assistantMessageId,
         textToSend,
-        isFirstTurn
+        isFirstTurn,
+        attachmentsToSend[0]
       );
       return;
     }
@@ -1248,7 +1277,7 @@ export function App() {
       {isInitialLoading && (
         <AppSplashScreen
           onComplete={() => setIsInitialLoading(false)}
-          durationMs={2000}
+          durationMs={800}
         />
       )}
       <div
@@ -1354,8 +1383,10 @@ export function App() {
             </button>
           </nav>
 
-          {/* Zone 3: Header Actions (Reading Mode Toggle & Theme Toggle) */}
+          {/* Zone 3: Header Actions (Install App, Reading Mode Toggle & Theme Toggle) */}
           <div className="flex items-center gap-2 shrink-0">
+            <PWAInstallButton />
+
             {/* Reading Mode Toggle Button */}
             <button
               type="button"
@@ -1671,6 +1702,7 @@ export function App() {
 
       {/* Mandatory Gmail Login Gate for First-Time Users */}
       <LoginModal />
+      <OfflineIndicator />
       </div>
     </>
   );

@@ -1,6 +1,9 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 import { Check, Copy } from "lucide-react";
 
 interface MarkdownRendererProps {
@@ -11,6 +14,24 @@ interface MarkdownRendererProps {
 interface CodeBlockProps {
   language: string;
   value: string;
+}
+
+/**
+ * Normalizes LaTeX delimiters `\[ ... \]` and `\( ... \)` into `$$ ... $$` and `$ ... $`
+ * outside fenced/inline code spans so `remark-math` renders all standard math output cleanly.
+ */
+function preprocessMathMarkdown(raw: string): string {
+  if (!raw) return "";
+  const segments = raw.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
+  return segments
+    .map((segment, index) => {
+      // Odd indices are code blocks or inline code — keep untouched
+      if (index % 2 === 1) return segment;
+      return segment
+        .replace(/\\\[([\s\S]*?)\\\]/g, (_m, inner) => `\n$$\n${inner.trim()}\n$$\n`)
+        .replace(/\\\(([\s\S]*?)\\\)/g, (_m, inner) => `$${inner.trim()}$`);
+    })
+    .join("");
 }
 
 const CodeBlock: React.FC<CodeBlockProps> = ({ language, value }) => {
@@ -62,10 +83,13 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   content,
   isStreaming = false,
 }) => {
+  const processedContent = useMemo(() => preprocessMathMarkdown(content), [content]);
+
   return (
-    <div className="text-[15px] leading-[1.68] text-zinc-800 dark:text-zinc-100 break-words space-y-3">
+    <div className="markdown-math-prose text-[15px] leading-[1.68] text-zinc-800 dark:text-zinc-100 break-words space-y-3">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
         components={{
           h1: ({ children }) => (
             <h1 className="font-display text-xl font-semibold text-zinc-900 dark:text-zinc-50 mt-5 mb-2 tracking-tight">
@@ -148,7 +172,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
           },
         }}
       >
-        {content}
+        {processedContent}
       </ReactMarkdown>
       {isStreaming && (
         <span

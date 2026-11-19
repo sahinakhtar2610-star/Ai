@@ -78,16 +78,40 @@ export async function generateVideoFromPhoto(
     throw new Error("Canvas 2D context is not available.");
   }
 
+  // Pre-render radial vignette onto an offscreen canvas once for ultra-fast frame compositing
+  const vignetteCanvas = document.createElement("canvas");
+  vignetteCanvas.width = width;
+  vignetteCanvas.height = height;
+  const vCtx = vignetteCanvas.getContext("2d");
+  if (vCtx) {
+    const vignette = vCtx.createRadialGradient(
+      width / 2,
+      height / 2,
+      width * 0.25,
+      width / 2,
+      height / 2,
+      width * 0.75
+    );
+    vignette.addColorStop(0, "rgba(0, 0, 0, 0)");
+    vignette.addColorStop(1, "rgba(0, 0, 0, 0.42)");
+    vCtx.fillStyle = vignette;
+    vCtx.fillRect(0, 0, width, height);
+  }
+
   // Pre-generate ambient drifting particles
-  const particleCount = 36;
+  const particleCount = 32;
   const particles = Array.from({ length: particleCount }).map(() => ({
     x: Math.random() * width,
     y: Math.random() * height,
-    radius: Math.random() * 3.5 + 1.2,
-    speedX: (Math.random() - 0.4) * 1.2,
-    speedY: -Math.random() * 1.4 - 0.4,
-    alpha: Math.random() * 0.5 + 0.2,
+    radius: Math.random() * 3.2 + 1.2,
+    speedX: (Math.random() - 0.4) * 1.1,
+    speedY: -Math.random() * 1.2 - 0.35,
+    alpha: Math.random() * 0.45 + 0.2,
   }));
+
+  if (typeof MediaRecorder === "undefined" || typeof canvas.captureStream !== "function") {
+    throw new Error("Video recording is not supported in this browser.");
+  }
 
   const stream = canvas.captureStream(fps);
   let mimeType = getSupportedVideoMimeType();
@@ -97,7 +121,7 @@ export async function generateVideoFromPhoto(
   try {
     recorder = new MediaRecorder(stream, {
       mimeType,
-      videoBitsPerSecond: 6000000, // 6 Mbps high-bitrate Ultra-HD encoding
+      videoBitsPerSecond: 5000000,
     });
   } catch {
     try {
@@ -114,22 +138,21 @@ export async function generateVideoFromPhoto(
     }
   };
 
-  const totalFrames = Math.floor(durationSeconds * fps);
+  const totalDurationMs = durationSeconds * 1000;
 
-  const drawFrame = (currentFrame: number) => {
-    const t = currentFrame / Math.max(totalFrames, 1);
+  const drawFrameAtProgress = (tRaw: number) => {
+    const t = Math.max(0, Math.min(1, tRaw));
     const ease = -(Math.cos(Math.PI * t) - 1) / 2;
 
     ctx.fillStyle = "#090d16";
     ctx.fillRect(0, 0, width, height);
 
-    // Motion calculation
     let zoom = 1.0;
     let panX = 0;
     let panY = 0;
 
     if (motionPreset === "cinematic_zoom") {
-      zoom = 1.0 + ease * 0.14; // smooth 14% zoom into center
+      zoom = 1.0 + ease * 0.14;
       panY = ease * 14;
     } else if (motionPreset === "pan_orbit") {
       zoom = 1.06 + Math.sin(t * Math.PI) * 0.08;
@@ -140,7 +163,6 @@ export async function generateVideoFromPhoto(
       panX = Math.cos(t * Math.PI) * 18;
     }
 
-    // Draw image covering canvas with zoom & pan
     const imgAspect = (baseImg.naturalWidth || 1) / (baseImg.naturalHeight || 1);
     const canvasAspect = width / height;
 
@@ -158,19 +180,10 @@ export async function generateVideoFromPhoto(
 
     ctx.drawImage(baseImg, offsetX, offsetY, drawW, drawH);
 
-    // Cinematic vignette & subtle lighting atmosphere
-    const vignette = ctx.createRadialGradient(
-      width / 2,
-      height / 2,
-      width * 0.25,
-      width / 2,
-      height / 2,
-      width * 0.75
-    );
-    vignette.addColorStop(0, "rgba(0, 0, 0, 0)");
-    vignette.addColorStop(1, "rgba(0, 0, 0, 0.45)");
-    ctx.fillStyle = vignette;
-    ctx.fillRect(0, 0, width, height);
+    // Composite cached vignette in a single GPU blit
+    if (vCtx) {
+      ctx.drawImage(vignetteCanvas, 0, 0);
+    }
 
     // Atmospheric dust / light particles
     for (const p of particles) {
@@ -198,7 +211,6 @@ export async function generateVideoFromPhoto(
     ctx.shadowBlur = 14;
     ctx.shadowOffsetY = 4;
 
-    // Rounded badge
     ctx.beginPath();
     ctx.moveTo(badgeX + radius, badgeY);
     ctx.lineTo(badgeX + badgeW - radius, badgeY);
@@ -218,32 +230,34 @@ export async function generateVideoFromPhoto(
     ctx.stroke();
     ctx.restore();
 
-    // Draw Star Logo
     if (logoImg) {
       ctx.drawImage(logoImg, badgeX + 12, badgeY + 9, 36, 36);
     }
 
-    // Draw Text "SAHIN AI"
     ctx.fillStyle = "#FFFFFF";
     ctx.font = "bold 18px system-ui, sans-serif";
     ctx.fillText("SAHIN AI", badgeX + 56, badgeY + 26);
 
-    // Subtitle "4K ULTRA HD · VIDEO"
-    ctx.fillStyle = "#2dd4bf"; // teal
+    ctx.fillStyle = "#2dd4bf";
     ctx.font = "bold 10px system-ui, sans-serif";
     ctx.fillText("4K ULTRA HD · VIDEO", badgeX + 56, badgeY + 42);
   };
 
-  // Draw initial frame before recorder starts
-  drawFrame(0);
+  drawFrameAtProgress(0);
 
   return new Promise<{ videoUrl: string; duration: number; mimeType: string }>(
     (resolve, reject) => {
       let isCompleted = false;
+      let timerId: number | null = null;
 
       recorder.onstop = () => {
         if (isCompleted) return;
         isCompleted = true;
+        if (timerId !== null) clearTimeout(timerId);
+        if (recordedChunks.length === 0) {
+          reject(new Error("Video encoding produced an empty stream."));
+          return;
+        }
         try {
           const blob = new Blob(recordedChunks, { type: mimeType });
           const videoUrl = URL.createObjectURL(blob);
@@ -256,24 +270,38 @@ export async function generateVideoFromPhoto(
       recorder.onerror = (e) => {
         if (isCompleted) return;
         isCompleted = true;
+        if (timerId !== null) clearTimeout(timerId);
         reject(new Error(`MediaRecorder error: ${e}`));
       };
 
       try {
-        recorder.start(100); // chunk every 100ms
+        recorder.start(200);
       } catch (startErr) {
         reject(startErr);
         return;
       }
 
-      let currentFrame = 0;
+      const startTime = performance.now();
       const frameIntervalMs = 1000 / fps;
+      let lastProgress = -1;
 
-      const renderLoop = () => {
-        currentFrame++;
-        if (currentFrame >= totalFrames) {
+      const tick = () => {
+        if (isCompleted) return;
+        const elapsed = performance.now() - startTime;
+        const progress = Math.min(1, elapsed / totalDurationMs);
+
+        drawFrameAtProgress(progress);
+
+        const pct = Math.min(99, Math.round(progress * 100));
+        if (onProgress && pct !== lastProgress) {
+          lastProgress = pct;
+          onProgress(pct);
+        }
+
+        if (elapsed >= totalDurationMs) {
           try {
             if (recorder.state === "recording") {
+              recorder.requestData?.();
               recorder.stop();
             }
           } catch {
@@ -282,16 +310,10 @@ export async function generateVideoFromPhoto(
           return;
         }
 
-        drawFrame(currentFrame);
-
-        if (onProgress) {
-          onProgress(Math.min(99, Math.round((currentFrame / totalFrames) * 100)));
-        }
-
-        setTimeout(renderLoop, frameIntervalMs);
+        timerId = window.setTimeout(tick, frameIntervalMs);
       };
 
-      setTimeout(renderLoop, frameIntervalMs);
+      timerId = window.setTimeout(tick, frameIntervalMs);
     }
   );
 }

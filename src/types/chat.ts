@@ -45,6 +45,7 @@ export interface ChatMessage {
   webSearchUsed?: boolean;
   generatedImages?: GeneratedImage[];
   generatedVideos?: GeneratedVideo[];
+  audioUrl?: string;
   isError?: boolean;
 }
 

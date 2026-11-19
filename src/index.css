@@ -42,3 +42,18 @@
 *::-webkit-scrollbar-thumb:hover {
   background-color: rgba(113, 113, 122, 0.5);
 }
+
+/* KaTeX math display overflow and clarity */
+.markdown-math-prose .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.5rem 0.75rem;
+  margin: 0.75rem 0;
+  border-radius: 0.75rem;
+  background-color: rgba(113, 113, 122, 0.06);
+}
+
+.dark .markdown-math-prose .katex-display {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
